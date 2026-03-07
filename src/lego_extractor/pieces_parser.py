@@ -42,6 +42,7 @@ class PiecesListParser:
         pieces_pages: List[int],
         dpi: int = 300,
         debug_output_dir: Optional[Path] = None,
+        threshold: int = 200,
     ):
         """Initialize pieces list parser.
 
@@ -50,12 +51,15 @@ class PiecesListParser:
             pieces_pages: List of page numbers to parse
             dpi: DPI for PDF to image conversion
             debug_output_dir: Directory for debug output (None to disable)
+            threshold: Threshold for piece detection (pixels >= threshold are background)
         """
         self.pieces_pdf = pieces_pdf
         self.pieces_pages = pieces_pages
         self.dpi = dpi
         self.debug_output_dir = debug_output_dir
+        self.threshold = threshold
         self.parts_list_output_dir = None
+        self.contour_debug_dir = None
         self.logger = logging.getLogger(__name__)
         self.poppler_path = find_poppler_path()
 
@@ -64,6 +68,9 @@ class PiecesListParser:
             # Create subdirectory for parts list extracted images
             self.parts_list_output_dir = self.debug_output_dir / "parts_list_extracted"
             self.parts_list_output_dir.mkdir(parents=True, exist_ok=True)
+            # Create subdirectory for contour detection debug images
+            self.contour_debug_dir = self.debug_output_dir / "contour_debug"
+            self.contour_debug_dir.mkdir(parents=True, exist_ok=True)
 
     def parse(self) -> Dict[str, PieceReference]:
         """Parse pieces list pages and build reference database.
@@ -116,6 +123,9 @@ class PiecesListParser:
             )
             Image.fromarray(page_image).save(debug_path)
 
+        # Get text positions from PDF and mask them out
+        page_image = self._mask_out_pdf_text(page_image, page_num)
+
         # Extract text with positions using pytesseract
         ocr_data = pytesseract.image_to_data(
             page_image,
@@ -165,7 +175,7 @@ class PiecesListParser:
                 if self.parts_list_output_dir:
                     part_output_path = (
                         self.parts_list_output_dir
-                        / f"piece_{page_num:02d}_{piece_num}.png"
+                        / f"piece_{piece_num}_{page_num:02d}.png"
                     )
                     Image.fromarray(piece_image).save(part_output_path)
 
@@ -205,6 +215,48 @@ class PiecesListParser:
                 )
 
         return piece_numbers
+
+    def _mask_out_pdf_text(self, page_image: np.ndarray, page_num: int) -> np.ndarray:
+        """Mask out text from PDF to avoid it being detected as part of pieces.
+
+        Args:
+            page_image: The page image array
+            page_num: Page number (1-indexed)
+
+        Returns:
+            Image with text areas filled with white
+        """
+        result = page_image.copy()
+
+        try:
+            with pdfplumber.open(self.pieces_pdf) as pdf:
+                if page_num - 1 >= len(pdf.pages):
+                    return result
+
+                page = pdf.pages[page_num - 1]
+                text_elements = page.extract_words()
+
+                if not text_elements:
+                    return result
+
+                for word in text_elements:
+                    x0 = int(word["x0"])
+                    top = int(word["top"])
+                    x1 = int(word["x1"])
+                    y1 = int(word["bottom"])
+
+                    x0 = max(0, x0)
+                    top = max(0, top)
+                    x1 = min(result.shape[1], x1)
+                    y1 = min(result.shape[0], y1)
+
+                    if y1 > top and x1 > x0:
+                        result[top:y1, x0:x1] = 255
+
+        except Exception as e:
+            self.logger.warning(f"Failed to extract PDF text for masking: {e}")
+
+        return result
 
     def _extract_quantities(self, ocr_data: dict) -> List[dict]:
         """Extract quantities (e.g., 1x, 2x, etc.) from OCR data.
@@ -290,56 +342,97 @@ class PiecesListParser:
         search_height: int = 120,
         search_width: int = 60,
     ) -> Optional[np.ndarray]:
-        """Extract piece image above piece number.
+        """Extract piece image above piece number with adaptive region expansion.
 
         Args:
             page_image: Full page image
             piece_num_data: Piece number data dictionary
-            search_height: Height to search above number (pixels)
-            search_width: Width to search on each side (pixels)
+            search_height: Initial height to search above number (pixels)
+            search_width: Initial width to search on each side (pixels)
 
         Returns:
             Piece image as numpy array, or None if extraction fails
         """
-        # Define search region
-        # The piece number OCR box includes quantity text (e.g., "2x") below the actual number
-        # We need to search above the entire piece number box to avoid including text
         piece_num_center_x = piece_num_data["x"] + piece_num_data["w"] / 2
         piece_num_top_y = piece_num_data["y"]
 
-        # Search region should be above the piece number box
-        x0 = max(0, int(piece_num_center_x - search_width))
-        y0 = max(0, int(piece_num_top_y - search_height))
-        x1 = min(page_image.shape[1], int(piece_num_center_x + search_width))
-        # Extend slightly below the piece number top to capture full part
-        # but stay above the quantity text which is typically 15-20px below
-        y1 = min(page_image.shape[0], int(piece_num_top_y + 10))
+        left_mult = 1.0
+        right_mult = 1.0
+        up_mult = 2.0
+        down_mult = 0.8
+        mult_increment = 0.4
+        max_iterations = 5
 
-        if y1 <= y0 or x1 <= x0:
-            return None
+        for iteration in range(max_iterations):
+            x0 = max(0, int(piece_num_center_x - search_width * left_mult))
+            y0 = max(0, int(piece_num_top_y - search_height * up_mult))
+            x1 = min(page_image.shape[1], int(piece_num_center_x + search_width * right_mult))
+            y1 = min(page_image.shape[0], int(piece_num_top_y + search_height * down_mult))
 
-        # Extract region
-        region = page_image[y0:y1, x0:x1]
+            if y1 <= y0 or x1 <= x0:
+                return None
 
-        if region.size == 0:
-            return None
+            region = page_image[y0:y1, x0:x1]
 
-        # Find piece boundaries using edge detection
-        piece_image = self._find_piece_in_region(region, exclude_bottom_text=True)
+            if region.size == 0:
+                return None
+
+            region_piece_num_x = piece_num_center_x - x0
+            region_piece_num_y = piece_num_top_y - y0
+            debug_info = None
+            if self.contour_debug_dir:
+                debug_info = {
+                    "piece_num": piece_num_data["text"],
+                    "iteration": iteration,
+                    "region_coords": (x0, y0, x1, y1)
+                }
+            piece_image, bbox = self._find_piece_in_region(
+                region, exclude_bottom_text=True,
+                piece_num_x=region_piece_num_x, piece_num_y=region_piece_num_y,
+                debug_info=debug_info
+            )
+
+            if bbox is None:
+                return piece_image
+
+            region_h, region_w = region.shape[:2]
+            edge_threshold = 2
+            touches_left = bbox["x"] <= edge_threshold
+            touches_right = bbox["x"] + bbox["w"] >= region_w - edge_threshold
+            touches_top = bbox["y"] <= edge_threshold
+            touches_bottom = bbox["y"] + bbox["h"] >= region_h - edge_threshold
+
+            if not (touches_left or touches_right or touches_top or touches_bottom):
+                break
+
+            if touches_left:
+                left_mult += mult_increment
+            if touches_right:
+                right_mult += mult_increment
+            if touches_top:
+                up_mult += mult_increment
+            if touches_bottom:
+                down_mult += mult_increment
 
         return piece_image
 
     def _find_piece_in_region(
-        self, region: np.ndarray, exclude_bottom_text: bool = False
-    ) -> Optional[np.ndarray]:
+        self, region: np.ndarray, exclude_bottom_text: bool = False,
+        piece_num_x: float = None, piece_num_y: float = None,
+        debug_info: dict = None
+    ) -> Tuple[Optional[np.ndarray], Optional[dict]]:
         """Find piece boundaries within a region using background filtering.
 
         Args:
             region: Image region to search
             exclude_bottom_text: If True, exclude small contours near the bottom (quantity text)
+            piece_num_x: X position of piece number in region coords (for closest contour)
+            piece_num_y: Y position of piece number in region coords (for closest contour)
+            debug_info: Dict with debug info for saving contour images
 
         Returns:
-            Cropped piece image with white background or original region if detection fails
+            Tuple of (cropped piece image with white background or original region if detection fails,
+                     bbox dict with keys x, y, w, h or None if detection fails)
         """
         # Convert to grayscale if needed
         if len(region.shape) == 3:
@@ -350,7 +443,7 @@ class PiecesListParser:
 
         # Apply threshold to find foreground (piece)
         # Assuming white background - anything not white is part of the piece
-        _, binary = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+        _, binary = cv2.threshold(gray, self.threshold, 255, cv2.THRESH_BINARY_INV)
 
         # This binary mask has piece=255 (white), background=0 (black)
         part_mask = binary
@@ -367,7 +460,7 @@ class PiecesListParser:
 
         if not contours:
             # No clear boundaries, return whole region
-            return region
+            return region, None
 
         # Filter contours to find the piece (not small text)
         region_height, region_width = region.shape[:2]
@@ -395,14 +488,37 @@ class PiecesListParser:
             # No valid contours found - try returning top 80% of region to exclude text
             if exclude_bottom_text:
                 crop_height = int(region_height * 0.8)
-                return region[0:crop_height, :]
-            return region
+                return region[0:crop_height, :], None
+            return region, None
 
-        # Find largest valid contour (the piece)
-        largest_area, largest_contour = max(valid_contours, key=lambda x: x[0])
+        # Find contour closest to piece number position (if provided), otherwise largest
+        if piece_num_x is not None and piece_num_y is not None:
+            def contour_distance(contour_item):
+                _, contour = contour_item
+                cx, cy, cw, ch = cv2.boundingRect(contour)
+                cont_center_x = cx + cw / 2
+                cont_center_y = cy + ch / 2
+                return ((cont_center_x - piece_num_x) ** 2 + (cont_center_y - piece_num_y) ** 2) ** 0.5
+            _, best_contour = min(valid_contours, key=contour_distance)
+        else:
+            _, best_contour = max(valid_contours, key=lambda x: x[0])
 
-        # Get bounding box of contour, then refine using mask
-        cont_x, cont_y, cont_w, cont_h = cv2.boundingRect(largest_contour)
+        # Save debug image with binary and contours
+        if debug_info:
+            self._save_contour_debug(
+                region, part_mask, valid_contours, best_contour,
+                piece_num_x, piece_num_y, debug_info
+            )
+
+        # Get bounding box of selected contour
+        cont_x, cont_y, cont_w, cont_h = cv2.boundingRect(best_contour)
+
+        # If contour is very wide, try to split by vertical gaps
+        if cont_w > cont_h * 1.5 and cont_w > 50:
+            sub_bboxes = self._split_by_vertical_gaps(part_mask, cont_x, cont_y, cont_w, cont_h)
+            if len(sub_bboxes) > 1 and piece_num_x is not None:
+                best_sub = min(sub_bboxes, key=lambda b: abs((b[0] + b[2]/2) - piece_num_x))
+                cont_x, cont_y, cont_w, cont_h = best_sub
 
         # Extract the contour region
         contour_region_mask = part_mask[
@@ -449,8 +565,95 @@ class PiecesListParser:
                 piece
             )
             piece = padded_piece
+            final_x -= padding
+            final_y -= padding
+            final_w += 2 * padding
+            final_h += 2 * padding
 
-        return piece if piece.size > 0 else region
+        bbox = {"x": final_x, "y": final_y, "w": final_w, "h": final_h}
+        return piece if piece.size > 0 else region, bbox
+
+    def _split_by_vertical_gaps(
+        self, part_mask: np.ndarray, x: int, y: int, w: int, h: int
+    ) -> List[Tuple[int, int, int, int]]:
+        """Split a bounding box by finding vertical gaps (white columns).
+
+        Args:
+            part_mask: Binary mask with piece=255, background=0
+            x, y, w, h: Bounding box of the contour to split
+
+        Returns:
+            List of (x, y, w, h) tuples for each sub-region
+        """
+        region = part_mask[y:y+h, x:x+w]
+
+        col_white_ratio = []
+        for col in range(w):
+            white_pixels = np.sum(region[:, col] > 0)
+            ratio = white_pixels / h
+            col_white_ratio.append(ratio)
+
+        gap_cols = []
+        min_gap_width = 3
+        current_gap_start = None
+        for i, ratio in enumerate(col_white_ratio):
+            if ratio < 0.1:
+                if current_gap_start is None:
+                    current_gap_start = i
+            else:
+                if current_gap_start is not None:
+                    gap_width = i - current_gap_start
+                    if gap_width >= min_gap_width:
+                        gap_cols.append((current_gap_start, i))
+                    current_gap_start = None
+        if current_gap_start is not None:
+            gap_width = w - current_gap_start
+            if gap_width >= min_gap_width:
+                gap_cols.append((current_gap_start, w))
+
+        if len(gap_cols) == 0:
+            return [(x, y, w, h)]
+
+        split_points = [0] + [g[1] for g in gap_cols] + [w]
+
+        sub_bboxes = []
+        for i in range(len(split_points) - 1):
+            sub_x = split_points[i]
+            sub_w = split_points[i + 1] - sub_x
+            sub_region = region[:, sub_x:sub_x+sub_w]
+            rows_with_white = np.where(np.any(sub_region > 0, axis=1))[0]
+            if len(rows_with_white) > 0:
+                sub_y = rows_with_white[0]
+                sub_h = rows_with_white[-1] - sub_y + 1
+                sub_bboxes.append((x + sub_x, y + sub_y, sub_w, sub_h))
+
+        return sub_bboxes if sub_bboxes else [(x, y, w, h)]
+
+    def _save_contour_debug(
+        self, region: np.ndarray, part_mask: np.ndarray,
+        valid_contours: List, best_contour,
+        piece_num_x: float, piece_num_y: float,
+        debug_info: dict
+    ):
+        """Save debug image showing binary mask and contours."""
+        piece_num = debug_info["piece_num"]
+        iteration = debug_info["iteration"]
+        region_coords = debug_info["region_coords"]
+
+        inverted_mask = 255 - part_mask
+        debug_img = cv2.cvtColor(inverted_mask, cv2.COLOR_GRAY2BGR)
+
+        for area, contour in valid_contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            color = (0, 255, 0) if contour is best_contour else (0, 0, 255)
+            cv2.rectangle(debug_img, (x, y), (x + w, y + h), color, 2)
+
+        if piece_num_x is not None and piece_num_y is not None:
+            cv2.circle(debug_img, (int(piece_num_x), int(piece_num_y)), 8, (255, 0, 0), 2)
+
+        filename = f"piece_{piece_num}_iter{iteration}_region{region_coords[0]}_{region_coords[1]}.png"
+        filepath = self.contour_debug_dir / filename
+        cv2.imwrite(str(filepath), debug_img)
 
     def _normalize_image(self, image: np.ndarray) -> np.ndarray:
         """Normalize image for matching.

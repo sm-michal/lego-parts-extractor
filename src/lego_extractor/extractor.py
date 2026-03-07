@@ -125,6 +125,7 @@ class LegoPartsExtractor:
         min_piece_size: int = 20,
         max_piece_size: int = 250,
         dpi: int = 300,
+        pieces_threshold: int = 200,
         debug_output_dir: Optional[Path] = None,
     ):
         """Initialize LEGO Parts Extractor.
@@ -141,6 +142,7 @@ class LegoPartsExtractor:
             min_piece_size: Minimum piece dimensions
             max_piece_size: Maximum piece dimensions
             dpi: PDF to image conversion DPI
+            pieces_threshold: Threshold for piece detection on pieces list pages
             debug_output_dir: Directory for debug output (None to disable)
         """
         self.instruction_pdf = instruction_pdf
@@ -154,6 +156,7 @@ class LegoPartsExtractor:
         self.min_piece_size = min_piece_size
         self.max_piece_size = max_piece_size
         self.dpi = dpi
+        self.pieces_threshold = pieces_threshold
         self.debug_output_dir = debug_output_dir
 
         self.logger = logging.getLogger(__name__)
@@ -211,6 +214,7 @@ class LegoPartsExtractor:
             pieces_pdf=self.pieces_pdf,
             pieces_pages=self.pieces_pages,
             dpi=self.dpi,
+            threshold=self.pieces_threshold,
             debug_output_dir=self.debug_output_dir,
         )
         self.reference_database = parser.parse()

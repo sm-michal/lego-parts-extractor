@@ -147,6 +147,13 @@ Examples:
         metavar="NUM",
         help="PDF to image conversion DPI (default: 300)",
     )
+    detection_group.add_argument(
+        "--pieces-threshold",
+        type=int,
+        default=200,
+        metavar="NUM",
+        help="Threshold for piece detection on pieces list pages (default: 200)",
+    )
 
     # Utilities
     utility_group = parser.add_argument_group("Utilities")
@@ -251,6 +258,7 @@ def main(argv: Optional[list] = None) -> int:
             min_piece_size=args.min_piece_size,
             max_piece_size=args.max_piece_size,
             dpi=args.dpi,
+            pieces_threshold=args.pieces_threshold,
             debug_output_dir=args.debug_output,
         )
 
