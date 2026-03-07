@@ -147,7 +147,7 @@ def find_poppler_path() -> Optional[str]:
     possible_paths = [
         # User's Downloads folder (common for manual downloads)
         Path.home() / "Downloads" / "poppler-25.12.0" / "Library" / "bin",
-        Path("C:/Users/michals/Downloads/poppler-25.12.0/Library/bin"),
+        Path("C:/Users/micha/poppler-25.12.0/Library/bin"),
         # Standard installation locations
         Path("C:/Program Files/poppler/Library/bin"),
         Path("C:/Program Files (x86)/poppler/Library/bin"),
