@@ -23,7 +23,7 @@ def test_end_to_end():
     """Test complete extraction pipeline."""
 
     # Configuration
-    sample_pdf = Path(r"C:\Users\michals\lego_sample.pdf")
+    sample_pdf = Path("instructions/60337_1.pdf")
     instruction_pages = [10, 12]  # Pages with parts
     pieces_pages = [32, 33]  # First 2 pieces list pages
     debug_dir = Path("debug_e2e_test")

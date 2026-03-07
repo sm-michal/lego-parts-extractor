@@ -23,7 +23,7 @@ def test_pieces_parser():
     """Test pieces list parser on sample pages."""
 
     # Configuration
-    sample_pdf = Path(r"C:\Users\michals\lego_sample.pdf")
+    sample_pdf = Path("instructions/60337_1.pdf")
     pieces_pages = [32, 33]  # Test first 2 pieces list pages
     debug_dir = Path("debug_phase2_test")
 

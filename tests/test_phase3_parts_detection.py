@@ -23,7 +23,7 @@ def test_parts_detection():
     """Test parts detection on sample pages."""
 
     # Configuration
-    sample_pdf = Path(r"C:\Users\michals\lego_sample.pdf")
+    sample_pdf = Path("instructions/60337_1.pdf")
     test_pages = [10, 12]  # Pages known to have parts lists
     debug_dir = Path("debug_phase3_test")
 
