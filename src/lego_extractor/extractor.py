@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import List, Optional
 from datetime import datetime
 
+from PIL import Image
+
 from .analyzer import auto_detect_pieces_pages
 from .pieces_parser import PiecesListParser
 from .parts_detector import PartsDetector
@@ -254,14 +256,28 @@ class LegoPartsExtractor:
 
         Implemented in Phase 5.
         """
+        # Create matched pieces folder
+        matched_pieces_dir = None
+        if self.debug_output_dir:
+            matched_pieces_dir = self.debug_output_dir / "matched_pieces"
+            matched_pieces_dir.mkdir(parents=True, exist_ok=True)
+
         # Build shopping list from matches
         piece_data = {}  # piece_number -> list of matches
+        saved_pieces = set()  # Track which piece numbers we've saved
 
         for match in matches:
             if match.best_match:
                 if match.best_match not in piece_data:
                     piece_data[match.best_match] = []
                 piece_data[match.best_match].append(match)
+
+                # Save the extracted image with piece number as filename
+                if matched_pieces_dir and match.best_match not in saved_pieces:
+                    piece_img = match.extracted_part.image
+                    output_path = matched_pieces_dir / f"{match.best_match}.png"
+                    Image.fromarray(piece_img).save(output_path)
+                    saved_pieces.add(match.best_match)
 
         # Aggregate quantities and calculate statistics
         for piece_num, piece_matches in piece_data.items():

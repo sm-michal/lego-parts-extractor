@@ -265,17 +265,18 @@ class PiecesListParser:
         Returns:
             List of piece number data dictionaries
         """
+        joined_elements = self._join_nearby_text_elements(text_elements)
+        
         piece_numbers = []
 
-        for elem in text_elements:
+        for elem in joined_elements:
             text = elem.get("text", "")
             if not text:
                 continue
 
-            match = re.match(r"^(\d{6,7})$", text.strip())
-            if match:
+            if re.match(r"^\d{6,7}$", text.strip()):
                 piece_numbers.append({
-                    "text": match.group(1),
+                    "text": text.strip(),
                     "x": elem["x"],
                     "y": elem["y"],
                     "w": elem["w"],
@@ -283,6 +284,57 @@ class PiecesListParser:
                 })
 
         return piece_numbers
+
+    def _join_nearby_text_elements(self, text_elements: List[dict], max_gap: int = 15) -> List[dict]:
+        """Join text elements that are close together horizontally.
+
+        Args:
+            text_elements: List of text element dictionaries from PDF
+            max_gap: Maximum gap between text elements to join (default 15px)
+
+        Returns:
+            List of joined text element dictionaries
+        """
+        numeric_elements = []
+        for elem in text_elements:
+            text = elem.get("text", "")
+            if not text:
+                continue
+            if re.match(r"^\d+$", text.strip()):
+                numeric_elements.append({
+                    "text": text.strip(),
+                    "x": elem["x"],
+                    "y": elem["y"],
+                    "w": elem["w"],
+                    "h": elem["h"],
+                })
+
+        if not numeric_elements:
+            return text_elements
+
+        numeric_elements.sort(key=lambda e: (e["y"], e["x"]))
+
+        joined = []
+        i = 0
+        while i < len(numeric_elements):
+            current = numeric_elements[i].copy()
+            j = i + 1
+            while j < len(numeric_elements):
+                next_elem = numeric_elements[j]
+                if abs(next_elem["y"] - current["y"]) < current["h"] // 2:
+                    gap = next_elem["x"] - (current["x"] + current["w"])
+                    if 0 <= gap <= max_gap:
+                        current["text"] += next_elem["text"]
+                        current["w"] = (next_elem["x"] + next_elem["w"]) - current["x"]
+                        j += 1
+                    else:
+                        break
+                else:
+                    break
+            joined.append(current)
+            i = j
+
+        return joined
 
     def _extract_quantities_from_pdf(self, text_elements: List[dict]) -> List[dict]:
         """Extract quantities (e.g., 1x, 2x) from PDF text elements.
