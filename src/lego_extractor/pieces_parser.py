@@ -13,7 +13,7 @@ from PIL import Image
 import pytesseract
 import cv2
 
-from .utils import find_poppler_path, configure_tesseract
+from .utils import find_poppler_path, configure_tesseract, normalize_background_color
 
 # Configure Tesseract on Windows
 configure_tesseract()
@@ -579,6 +579,7 @@ class PiecesListParser:
         if piece_image.size == 0:
             return None
 
+        piece_image = normalize_background_color(piece_image)
         white_bg = np.ones_like(piece_image) * 255
         piece_image = np.where(piece_image < 240, piece_image, white_bg)
 

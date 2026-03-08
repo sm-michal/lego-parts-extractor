@@ -13,7 +13,7 @@ import pytesseract
 import cv2
 import pdfplumber
 
-from .utils import find_poppler_path, configure_tesseract, format_page_ranges
+from .utils import find_poppler_path, configure_tesseract, format_page_ranges, normalize_background_color
 
 # Configure Tesseract on Windows
 configure_tesseract()
@@ -567,6 +567,7 @@ class PartsDetector:
         if piece_image.size == 0:
             return None
 
+        piece_image = normalize_background_color(piece_image)
         white_bg = np.ones_like(piece_image) * 255
         piece_image = np.where(piece_image < 240, piece_image, white_bg)
 
@@ -985,6 +986,7 @@ class PartsDetector:
 
         # For parts matching, we need solid background, so replace transparent areas with white
         piece = piece_region.copy()
+        piece = normalize_background_color(piece)
         white_background = np.ones_like(piece_region) * 255
         mask_3channel = np.stack([piece_mask_region] * 3, axis=2) > 0
         piece = np.where(mask_3channel, piece_region, white_background)

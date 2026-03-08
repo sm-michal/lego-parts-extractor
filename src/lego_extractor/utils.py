@@ -5,7 +5,9 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+import numpy as np
 
 
 def setup_logging(level: int = logging.INFO) -> None:
@@ -220,3 +222,63 @@ def configure_tesseract():
         import pytesseract
 
         pytesseract.pytesseract.tesseract_cmd = tesseract_path
+
+
+def detect_background_color(image: np.ndarray, border_width: int = 3) -> Tuple[float, float, float]:
+    """Detect background color from border pixels.
+    
+    Args:
+        image: RGB image array
+        border_width: Width of border to sample (default 3)
+    
+    Returns:
+        Tuple of (mean_r, mean_g, mean_b) for background color
+    """
+    h, w = image.shape[:2]
+    
+    if h < border_width * 2 or w < border_width * 2:
+        return (255.0, 255.0, 255.0)
+    
+    top = image[:border_width, :]
+    bottom = image[-border_width:, :]
+    left = image[:, :border_width]
+    right = image[:, -border_width:]
+    
+    border_pixels = np.concatenate([
+        top.reshape(-1, 3),
+        bottom.reshape(-1, 3),
+        left.reshape(-1, 3),
+        right.reshape(-1, 3)
+    ])
+    
+    return tuple(np.mean(border_pixels, axis=0))
+
+
+def normalize_background_color(image: np.ndarray, target_color: Tuple[int, int, int] = (255, 255, 255)) -> np.ndarray:
+    """Normalize background color to target (usually white).
+    
+    Uses linear color transformation to map detected background color to target.
+    
+    Args:
+        image: RGB image array
+        target_color: Target background color (default white)
+    
+    Returns:
+        Image with normalized background
+    """
+    if len(image.shape) != 3 or image.shape[2] != 3:
+        return image
+    
+    bg_color = detect_background_color(image)
+    target = np.array(target_color, dtype=np.float32)
+    
+    result = image.astype(np.float32).copy()
+    
+    for c in range(3):
+        if bg_color[c] > 10:
+            scale = target[c] / bg_color[c]
+            result[:, :, c] = np.clip(result[:, :, c] * scale, 0, 255)
+        else:
+            result[:, :, c] = target[c]
+    
+    return result.astype(np.uint8)

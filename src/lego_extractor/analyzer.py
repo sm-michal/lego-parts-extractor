@@ -120,6 +120,23 @@ class PDFAnalyzer:
 
             detected_pieces_pages.reverse()  # Restore ascending order
 
+            # Additional check: if pieces list is near end of PDF, check remaining pages
+            # Use lower threshold - just check if there are ANY quantities or piece numbers
+            if detected_pieces_pages:
+                last_detected = detected_pieces_pages[-1]
+                remaining_pages = total_pages - last_detected
+                if remaining_pages > 0 and remaining_pages < 5:
+                    self.logger.debug(
+                        f"Pieces list ends at page {last_detected}, checking {remaining_pages} remaining pages..."
+                    )
+                    for page_num in range(last_detected + 1, total_pages + 1):
+                        page = pdf.pages[page_num - 1]
+                        if self._has_any_pieces_or_quantities(page):
+                            detected_pieces_pages.append(page_num)
+                            self.logger.debug(f"  Added page {page_num} (has pieces/quantities)")
+                        else:
+                            break
+
         # Determine instruction page candidates
         if self.instruction_pdf == self.pieces_pdf:
             # Same PDF - instruction pages are all others
@@ -217,6 +234,24 @@ class PDFAnalyzer:
         )
 
         return score, piece_count
+
+    def _has_any_pieces_or_quantities(self, page) -> bool:
+        """Check if page has any piece numbers or quantities (low threshold check).
+
+        Args:
+            page: pdfplumber page object
+
+        Returns:
+            True if page has any piece numbers or quantities
+        """
+        text = page.extract_text()
+        if not text:
+            return False
+
+        piece_numbers = re.findall(r"\b\d{6,7}\b", text)
+        quantities = re.findall(r"\b\d+x\b", text, re.IGNORECASE)
+
+        return len(piece_numbers) > 0 or len(quantities) > 0
 
 
 def auto_detect_pieces_pages(pdf_path: Path) -> List[int]:
