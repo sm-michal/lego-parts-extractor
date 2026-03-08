@@ -123,21 +123,18 @@ class PiecesListParser:
             )
             Image.fromarray(page_image).save(debug_path)
 
-        # Get text positions from PDF and mask them out
-        page_image = self._mask_out_pdf_text(page_image, page_num)
+        # Extract text and images from PDF
+        pdf_text = self._extract_text_from_pdf(page_num)
+        pdf_images, pdf_width, pdf_height = self._extract_images_from_pdf(page_num)
 
-        # Extract text with positions using pytesseract
-        ocr_data = pytesseract.image_to_data(
-            page_image,
-            output_type=pytesseract.Output.DICT,
-        )
+        self.logger.debug(f"    PDF has {len(pdf_images)} images, size {pdf_width}x{pdf_height}")
 
-        # Find piece numbers and quantities
-        piece_numbers = self._extract_piece_numbers(ocr_data)
-        quantities = self._extract_quantities(ocr_data)
+        # Find piece numbers and quantities from PDF text
+        piece_numbers = self._extract_piece_numbers_from_pdf(pdf_text)
+        quantities = self._extract_quantities_from_pdf(pdf_text)
 
         self.logger.debug(
-            f"    OCR found {len(piece_numbers)} piece numbers, {len(quantities)} quantities"
+            f"    PDF text found {len(piece_numbers)} piece numbers, {len(quantities)} quantities"
         )
 
         # Match piece numbers with quantities and extract images
@@ -151,11 +148,13 @@ class PiecesListParser:
                 piece_num_data["y"] + piece_num_data["h"],
             )
 
-            # Find quantity above this piece number (within ±50px horizontal, 0-40px above)
+            # Find quantity above this piece number
             quantity = self._find_quantity_above(piece_num_data, quantities)
 
-            # Extract piece image above the number (within ±50px horizontal, 10-80px above)
-            piece_image = self._extract_piece_image(page_image, piece_num_data)
+            # Extract piece image using PDF image positions
+            piece_image = self._extract_piece_from_pdf_image(
+                page_image, piece_num_data, pdf_images, pdf_width, pdf_height
+            )
 
             if piece_image is not None:
                 # Normalize image for matching
@@ -184,6 +183,134 @@ class PiecesListParser:
             self._create_debug_visualization(page_image, pieces, page_num)
 
         return pieces
+
+    def _extract_text_from_pdf(self, page_num: int) -> List[dict]:
+        """Extract text with positions from PDF using pdfplumber.
+
+        Args:
+            page_num: Page number (1-indexed)
+
+        Returns:
+            List of text element dictionaries with text, x, y, w, h
+        """
+        text_elements = []
+
+        try:
+            with pdfplumber.open(self.pieces_pdf) as pdf:
+                if page_num - 1 >= len(pdf.pages):
+                    return text_elements
+
+                page = pdf.pages[page_num - 1]
+                words = page.extract_words()
+
+                for word in words:
+                    text_elements.append({
+                        "text": word["text"],
+                        "x": int(word["x0"]),
+                        "y": int(word["top"]),
+                        "w": int(word["x1"] - word["x0"]),
+                        "h": int(word["bottom"] - word["top"]),
+                    })
+
+        except Exception as e:
+            self.logger.warning(f"Failed to extract PDF text: {e}")
+
+        return text_elements
+
+    def _extract_images_from_pdf(self, page_num: int) -> Tuple[List[dict], int, int]:
+        """Extract images from PDF with positions.
+
+        Args:
+            page_num: Page number (1-indexed)
+
+        Returns:
+            Tuple of (images list, pdf page width, pdf page height)
+        """
+        images = []
+        pdf_width = 612
+        pdf_height = 792
+
+        try:
+            with pdfplumber.open(self.pieces_pdf) as pdf:
+                if page_num - 1 >= len(pdf.pages):
+                    return images, pdf_width, pdf_height
+
+                page = pdf.pages[page_num - 1]
+                pdf_width = int(page.width)
+                pdf_height = int(page.height)
+                page_images = page.images
+
+                for img in page_images:
+                    images.append({
+                        "x0": int(img.get("x0", 0)),
+                        "y0": int(img.get("y0", 0)),
+                        "x1": int(img.get("x1", 0)),
+                        "y1": int(img.get("y1", 0)),
+                        "width": int(img.get("width", 0)),
+                        "height": int(img.get("height", 0)),
+                        "stream": img.get("stream"),
+                    })
+
+        except Exception as e:
+            self.logger.warning(f"Failed to extract PDF images: {e}")
+
+        return images, pdf_width, pdf_height
+
+    def _extract_piece_numbers_from_pdf(self, text_elements: List[dict]) -> List[dict]:
+        """Extract piece numbers from PDF text elements.
+
+        Args:
+            text_elements: List of text element dictionaries from PDF
+
+        Returns:
+            List of piece number data dictionaries
+        """
+        piece_numbers = []
+
+        for elem in text_elements:
+            text = elem.get("text", "")
+            if not text:
+                continue
+
+            match = re.match(r"^(\d{6,7})$", text.strip())
+            if match:
+                piece_numbers.append({
+                    "text": match.group(1),
+                    "x": elem["x"],
+                    "y": elem["y"],
+                    "w": elem["w"],
+                    "h": elem["h"],
+                })
+
+        return piece_numbers
+
+    def _extract_quantities_from_pdf(self, text_elements: List[dict]) -> List[dict]:
+        """Extract quantities (e.g., 1x, 2x) from PDF text elements.
+
+        Args:
+            text_elements: List of text element dictionaries from PDF
+
+        Returns:
+            List of quantity data dictionaries
+        """
+        quantities = []
+
+        for elem in text_elements:
+            text = elem.get("text", "")
+            if not text:
+                continue
+
+            match = re.match(r"^(\d+)x$", text.strip(), re.IGNORECASE)
+            if match:
+                quantities.append({
+                    "text": text.strip(),
+                    "x": elem["x"],
+                    "y": elem["y"],
+                    "w": elem["w"],
+                    "h": elem["h"],
+                })
+
+        return quantities
 
     def _extract_piece_numbers(self, ocr_data: dict) -> List[dict]:
         """Extract piece numbers (6-7 digit sequences) from OCR data.
@@ -334,6 +461,76 @@ class PiecesListParser:
                     best_match = qty["text"]
 
         return best_match
+
+    def _extract_piece_from_pdf_image(
+        self,
+        page_image: np.ndarray,
+        piece_num_data: dict,
+        pdf_images: List[dict],
+        pdf_width: int,
+        pdf_height: int
+    ) -> Optional[np.ndarray]:
+        """Extract piece image using PDF image positions.
+
+        Args:
+            page_image: Full page image (rendered)
+            piece_num_data: Piece number data from PDF text
+            pdf_images: List of image data from PDF
+            pdf_width: PDF page width in points
+            pdf_height: PDF page height in points
+
+        Returns:
+            Cropped piece image or None
+        """
+        if not pdf_images:
+            return None
+
+        piece_x = piece_num_data["x"]
+        piece_y = piece_num_data["y"]
+
+        img_width = page_image.shape[1]
+        img_height = page_image.shape[0]
+
+        scale_x = img_width / pdf_width
+        scale_y = img_height / pdf_height
+
+        def image_distance(img):
+            img_center_x = (img["x0"] + img["x1"]) / 2
+            img_bottom_y = pdf_height - img["y0"]
+            h_dist = abs(img_center_x - piece_x)
+            v_dist = piece_y - img_bottom_y
+            if v_dist < 0:
+                v_dist = abs(v_dist) * 10
+            return (h_dist ** 2 + v_dist ** 2) ** 0.5
+
+        pdf_images_sorted = sorted(pdf_images, key=image_distance)
+        best_img = pdf_images_sorted[0]
+
+        img_x0 = int(best_img["x0"] * scale_x)
+        img_y0 = int((pdf_height - best_img["y1"]) * scale_y)
+        img_x1 = int(best_img["x1"] * scale_x)
+        img_y1 = int((pdf_height - best_img["y0"]) * scale_y)
+
+        img_x0 = max(0, img_x0)
+        img_y0 = max(0, img_y0)
+        img_x1 = min(img_width, img_x1)
+        img_y1 = min(img_height, img_y1)
+
+        if img_y1 < img_y0:
+            img_y0, img_y1 = img_y1, img_y0
+
+        if img_x1 <= img_x0 or img_y1 <= img_y0:
+            return None
+
+        piece_image = page_image[img_y0:img_y1, img_x0:img_x1]
+
+        if piece_image.size == 0:
+            return None
+
+        white_bg = np.ones_like(piece_image) * 255
+        piece_image = np.where(piece_image < 240, piece_image, white_bg)
+
+        return piece_image
 
     def _extract_piece_image(
         self,

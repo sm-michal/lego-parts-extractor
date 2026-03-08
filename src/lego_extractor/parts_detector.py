@@ -13,7 +13,7 @@ import pytesseract
 import cv2
 import pdfplumber
 
-from .utils import find_poppler_path, configure_tesseract
+from .utils import find_poppler_path, configure_tesseract, format_page_ranges
 
 # Configure Tesseract on Windows
 configure_tesseract()
@@ -137,10 +137,6 @@ class PartsDetector:
             )
             Image.fromarray(page_image).save(debug_path)
 
-        # Detect and save parts boxes (blue rectangular regions)
-        if self.debug_output_dir:
-            self._detect_and_save_parts_boxes(page_image, page_num)
-
         # Try to extract text directly from PDF first (more reliable)
         quantities = self._extract_quantities_from_pdf(page_num, page_image, pdf)
 
@@ -160,12 +156,24 @@ class PartsDetector:
             self._save_quantity_debug_image(page_image, quantities, page_num)
 
         # Extract parts near each quantity
+        # Try PDF image extraction first (same algorithm as pieces list parser)
         parts = []
         for qty_idx, qty_data in enumerate(quantities):
             self.logger.debug(
                 f"    Processing quantity {qty_idx + 1}/{len(quantities)}: {qty_data['text']} at ({qty_data['x']}, {qty_data['y']})"
             )
-            part = self._extract_part_near_quantity(page_image, qty_data, page_num)
+            
+            # Try PDF image extraction first (same algorithm as pieces_parser)
+            part = self._extract_part_from_pdf_image(page_image, qty_data, page_num, pdf)
+            
+            # Fall back to contour-based extraction if PDF extraction fails
+            if part is None:
+                part = self._extract_part_near_quantity(page_image, qty_data, page_num)
+                if part is not None:
+                    self.logger.debug(f"      Used fallback extraction (contour-based)")
+            else:
+                self.logger.debug(f"      Used PDF image extraction")
+            
             if part is not None:
                 parts.append(part)
             else:
@@ -235,63 +243,6 @@ class PartsDetector:
         )
 
         return is_light_blue or is_dark_blue
-
-    def _detect_and_save_parts_boxes(self, page_image: np.ndarray, page_num: int):
-        """Detect and save parts box regions from instruction page.
-
-        Parts boxes are rectangular regions containing quantity indicators and parts.
-        We find them by grouping nearby quantity indicators.
-
-        Args:
-            page_image: Full page image (RGB)
-            page_num: Page number
-        """
-        # First, detect quantities to find where parts boxes are
-        # Try PDF extraction first
-        quantities = self._extract_quantities_from_pdf(page_num, page_image, None)
-
-        # Fall back to OCR if needed
-        if not quantities:
-            ocr_data = pytesseract.image_to_data(
-                page_image,
-                output_type=pytesseract.Output.DICT,
-            )
-            quantities = self._extract_quantities(ocr_data, page_image)
-
-        if not quantities:
-            return
-
-        # Group quantities that are close together (same parts box)
-        page_height, page_width = page_image.shape[:2]
-
-        # Simple approach: find min/max x,y of all quantities and add margin
-        # This assumes all quantities on a page are in the same parts box
-        # For pages with multiple parts boxes (top and bottom), we could cluster by y-position
-
-        xs = [q["x"] for q in quantities]
-        ys = [q["y"] for q in quantities]
-        ws = [q["w"] for q in quantities]
-        hs = [q["h"] for q in quantities]
-
-        if not xs:
-            return
-
-        # Define parts box as region containing all quantities plus margin
-        margin_x = 100
-        margin_y = 150  # More vertical margin to capture parts above quantities
-
-        x_min = max(0, min(xs) - margin_x)
-        y_min = max(0, min(ys) - margin_y)
-        x_max = min(page_width, max([x + w for x, w in zip(xs, ws)]) + margin_x)
-        y_max = min(page_height, max([y + h for y, h in zip(ys, hs)]) + margin_y)
-
-        # Extract and save the parts box region
-        box_image = page_image[y_min:y_max, x_min:x_max]
-
-        output_path = (
-            self.debug_output_dir / f"instruction_page_{page_num:02d}_parts_box_1.png"
-        )
-        Image.fromarray(box_image).save(output_path)
 
     def _extract_quantities(self, ocr_data: dict, page_image: np.ndarray) -> List[dict]:
         """Extract quantity indicators from OCR data.
@@ -439,6 +390,208 @@ class PartsDetector:
             self.logger.warning(f"Failed to extract text from PDF page {page_num}: {e}")
 
         return quantities
+
+    def _extract_images_from_pdf(self, page_num: int, pdf=None) -> Tuple[List[dict], int, int]:
+        """Extract images from PDF with positions.
+
+        Args:
+            page_num: Page number (1-indexed)
+            pdf: Optional pdfplumber PDF object (for reuse across pages)
+
+        Returns:
+            Tuple of (images list, pdf page width, pdf page height)
+        """
+        images = []
+        pdf_width = 612
+        pdf_height = 792
+
+        if pdf is None:
+            try:
+                with pdfplumber.open(self.instruction_pdf) as pdf:
+                    return self._extract_images_from_pdf(page_num, pdf)
+            except Exception as e:
+                self.logger.warning(f"Failed to open PDF for image extraction: {e}")
+                return images, pdf_width, pdf_height
+
+        try:
+            if page_num - 1 >= len(pdf.pages):
+                return images, pdf_width, pdf_height
+
+            page = pdf.pages[page_num - 1]
+            pdf_width = int(page.width)
+            pdf_height = int(page.height)
+            page_images = page.images
+
+            for img in page_images:
+                images.append({
+                    "x0": int(img.get("x0", 0)),
+                    "y0": int(img.get("y0", 0)),
+                    "x1": int(img.get("x1", 0)),
+                    "y1": int(img.get("y1", 0)),
+                    "width": int(img.get("width", 0)),
+                    "height": int(img.get("height", 0)),
+                    "stream": img.get("stream"),
+                })
+
+        except Exception as e:
+            self.logger.warning(f"Failed to extract PDF images: {e}")
+
+        return images, pdf_width, pdf_height
+
+    def _extract_part_from_pdf_image(
+        self,
+        page_image: np.ndarray,
+        qty_data: dict,
+        page_num: int,
+        pdf=None,
+    ) -> Optional[ExtractedPart]:
+        """Extract part image using PDF image positions (same algorithm as pieces_parser).
+
+        Args:
+            page_image: Full page image
+            qty_data: Quantity data dictionary
+            page_num: Page number
+            pdf: Optional pdfplumber PDF object
+
+        Returns:
+            ExtractedPart object or None if extraction fails
+        """
+        qty_center_x = qty_data["x"] + qty_data["w"] / 2
+        qty_center_y = qty_data["y"] + qty_data["h"] / 2
+        debug_prefix = f"page{page_num:02d}_qty{qty_data['value']}_x{int(qty_center_x)}_y{int(qty_center_y)}"
+        
+        def save_debug_image(img_array, suffix):
+            if self.instruction_parts_output_dir:
+                path = self.instruction_parts_output_dir / f"{debug_prefix}_{suffix}.png"
+                Image.fromarray(img_array).save(path)
+
+        pdf_images, pdf_width, pdf_height = self._extract_images_from_pdf(page_num, pdf)
+
+        if not pdf_images:
+            save_debug_image(page_image[max(0, int(qty_center_y)-100):int(qty_center_y)+50, 
+                             max(0, int(qty_center_x)-100):int(qty_center_x)+100], "0_no_pdf_images")
+            return None
+
+        qty_x = qty_data["x"]
+        qty_y = qty_data["y"]
+
+        img_width = page_image.shape[1]
+        img_height = page_image.shape[0]
+
+        scale_x = img_width / pdf_width
+        scale_y = img_height / pdf_height
+
+        def image_distance(img):
+            img_center_x = (img["x0"] + img["x1"]) / 2
+            img_bottom_y = pdf_height - img["y0"]
+            h_dist = abs(img_center_x - qty_x)
+            v_dist = qty_y - img_bottom_y
+            if v_dist < 0:
+                v_dist = abs(v_dist) * 10
+            return (h_dist ** 2 + v_dist ** 2) ** 0.5
+
+        pdf_images_sorted = sorted(pdf_images, key=image_distance)
+        
+        best_img = None
+        best_distance = float("inf")
+        
+        for idx, img in enumerate(pdf_images_sorted):
+            img_x0 = int(img["x0"] * scale_x)
+            img_y0 = int((pdf_height - img["y1"]) * scale_y)
+            img_x1 = int(img["x1"] * scale_x)
+            img_y1 = int((pdf_height - img["y0"]) * scale_y)
+            
+            img_x0 = max(0, img_x0)
+            img_y0 = max(0, img_y0)
+            img_x1 = min(img_width, img_x1)
+            img_y1 = min(img_height, img_y1)
+            
+            if img_y1 < img_y0:
+                img_y0, img_y1 = img_y1, img_y0
+            
+            if img_x1 <= img_x0 or img_y1 <= img_y0:
+                continue
+            
+            img_center_x = (img_x0 + img_x1) / 2
+            img_center_y = (img_y0 + img_y1) / 2
+            
+            dist = ((img_center_x - qty_center_x) ** 2 + (img_center_y - qty_center_y) ** 2) ** 0.5
+            
+            if dist > self.search_radius * 3:
+                continue
+            
+            sample_region = page_image[img_y0:min(img_y0+20, img_height), img_x0:min(img_x0+20, img_width)]
+            if sample_region.size == 0:
+                continue
+            
+            r, g, b = sample_region[:,:,0], sample_region[:,:,1], sample_region[:,:,2]
+            mean_b = np.mean(b)
+            mean_r = np.mean(r)
+            mean_g = np.mean(g)
+            
+            is_blue_bg = mean_b > 200 and mean_b > mean_r + 30 and mean_b > mean_g + 10
+            
+            if not is_blue_bg:
+                save_debug_image(page_image[max(0, int(qty_center_y)-150):int(qty_center_y)+100,
+                                 max(0, int(qty_center_x)-150):int(qty_center_x)+150], 
+                               f"1_rejected_not_blue_bg")
+                continue
+            
+            best_img = img
+            best_distance = dist
+            break
+        
+        if best_img is None:
+            save_debug_image(page_image[max(0, int(qty_center_y)-150):int(qty_center_y)+100,
+                             max(0, int(qty_center_x)-150):int(qty_center_x)+150], 
+                           "2_no_suitable_image")
+            return None
+
+        img_x0 = int(best_img["x0"] * scale_x)
+        img_y0 = int((pdf_height - best_img["y1"]) * scale_y)
+        img_x1 = int(best_img["x1"] * scale_x)
+        img_y1 = int((pdf_height - best_img["y0"]) * scale_y)
+
+        img_x0 = max(0, img_x0)
+        img_y0 = max(0, img_y0)
+        img_x1 = min(img_width, img_x1)
+        img_y1 = min(img_height, img_y1)
+
+        if img_y1 < img_y0:
+            img_y0, img_y1 = img_y1, img_y0
+
+        if img_x1 <= img_x0 or img_y1 <= img_y0:
+            return None
+
+        piece_image = page_image[img_y0:img_y1, img_x0:img_x1]
+
+        if piece_image.size == 0:
+            return None
+
+        white_bg = np.ones_like(piece_image) * 255
+        piece_image = np.where(piece_image < 240, piece_image, white_bg)
+
+        h, w = piece_image.shape[:2]
+        if w < self.min_piece_size or h < self.min_piece_size:
+            save_debug_image(piece_image, f"3_rejected_too_small_{w}x{h}")
+            return None
+
+        normalized = self._normalize_image(piece_image)
+
+        part = ExtractedPart(
+            image=piece_image,
+            normalized_image=normalized,
+            quantity=qty_data["text"],
+            quantity_value=qty_data["value"],
+            page=page_num,
+            position=(int(qty_center_x), int(qty_center_y)),
+            bbox=(img_x0, img_y0, img_x1, img_y1),
+            confidence=qty_data["conf"] / 100.0,
+        )
+
+        save_debug_image(piece_image, "success")
+
+        return part
 
     def _extract_part_near_quantity(
         self,
