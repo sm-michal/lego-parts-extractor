@@ -512,12 +512,11 @@ class PartsDetector:
             if img_x1 <= img_x0 or img_y1 <= img_y0:
                 continue
             
-            img_center_x = (img_x0 + img_x1) / 2
-            img_center_y = (img_y0 + img_y1) / 2
+            closest_x = max(img_x0, min(qty_center_x, img_x1))
+            closest_y = max(img_y0, min(qty_center_y, img_y1))
+            dist_to_edge = ((closest_x - qty_center_x) ** 2 + (closest_y - qty_center_y) ** 2) ** 0.5
             
-            dist = ((img_center_x - qty_center_x) ** 2 + (img_center_y - qty_center_y) ** 2) ** 0.5
-            
-            if dist > self.search_radius * 3:
+            if dist_to_edge > self.search_radius * 3:
                 continue
             
             sample_region = page_image[img_y0:min(img_y0+20, img_height), img_x0:min(img_x0+20, img_width)]
@@ -538,7 +537,7 @@ class PartsDetector:
                 continue
             
             best_img = img
-            best_distance = dist
+            best_distance = dist_to_edge
             break
         
         if best_img is None:
